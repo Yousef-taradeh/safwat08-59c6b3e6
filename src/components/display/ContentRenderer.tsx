@@ -1,6 +1,6 @@
 /**
  * ======================================
- * Content Renderer — Lag-Free Edition
+ * Content Renderer — Lag-Free + Watchdog Edition
  * ======================================
  *
  * Bug fixes preserved:
@@ -19,6 +19,13 @@
  *   7. Only the CURRENT video is resolved via IndexedDB; next video loads on-demand
  *      after the transition completes, preventing bandwidth race conditions
  *   8. In-flight deduplication in getVideoBlobUrl prevents concurrent duplicate downloads
+ *
+ * Video Watchdog (added for 20h+ runtime stability):
+ *   9. Checks every 5 seconds that currentTime is advancing
+ *  10. Detects stall/freeze: paused=false, ended=false, readyState<3 OR currentTime stuck
+ *  11. On stall: reloads src and restarts playback without triggering a playlist transition
+ *  12. Max 3 consecutive recovery attempts before advancing to next item (safety valve)
+ *  13. Compatible with Samsung Smart TV (Tizen) and Android TV browsers
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
@@ -61,6 +68,14 @@ export function ContentRenderer({
 
   // Video element refs
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  // ── Watchdog refs ──
+  // Tracks last known currentTime to detect a "time stuck" stall
+  const lastCurrentTimeRef      = useRef<number>(-1);
+  // Counts consecutive stall detections to cap recovery attempts
+  const stallCountRef           = useRef<number>(0);
+  const WATCHDOG_INTERVAL_MS    = 5000;  // check every 5 s
+  const MAX_STALL_BEFORE_SKIP   = 3;     // after 3 failed recoveries → skip to next item
 
   // ---- Resolve only CURRENT video via IndexedDB cache ----
   // Only download ONE video at a time — prevents bandwidth competition
@@ -201,6 +216,70 @@ export function ContentRenderer({
   // Re-attach only when the video element changes (i.e. content type switch)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentIndex]);
+
+  // ---- Video Watchdog — detects and recovers from stall/freeze ----
+  // Runs every 5 s while a video is playing.
+  // Detects two types of stall:
+  //   A) readyState < HAVE_FUTURE_DATA (< 3) — browser ran out of buffered data
+  //   B) currentTime has not advanced in 5 s — "time stuck" freeze (the bug observed)
+  // Recovery sequence:
+  //   Attempt 1–2: reload src blob and call play()
+  //   Attempt 3  : advance to next playlist item (prevents permanent black screen)
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !isPlaying) return;
+
+    // Reset tracking when the video source changes (new item starts)
+    lastCurrentTimeRef.current = -1;
+    stallCountRef.current      = 0;
+
+    const id = setInterval(() => {
+      if (!video) return;
+
+      // Ignore if the video has naturally ended or is legitimately paused
+      if (video.ended || !isPlayingRef.current) return;
+
+      // Detect stall condition
+      const timeStuck       = lastCurrentTimeRef.current === video.currentTime && !video.paused;
+      const lowReadyState   = !video.paused && !video.ended && video.readyState < 3;
+      const isStalled       = timeStuck || lowReadyState;
+
+      lastCurrentTimeRef.current = video.currentTime;
+
+      if (!isStalled) {
+        // Healthy playback — reset stall counter
+        stallCountRef.current = 0;
+        return;
+      }
+
+      stallCountRef.current += 1;
+      console.warn(
+        `[Watchdog] ⚠️ Stall detected (attempt ${stallCountRef.current}/${MAX_STALL_BEFORE_SKIP})`,
+        { timeStuck, lowReadyState, readyState: video.readyState, currentTime: video.currentTime }
+      );
+
+      if (stallCountRef.current >= MAX_STALL_BEFORE_SKIP) {
+        // Failed multiple recovery attempts — skip to next item
+        console.error('[Watchdog] ❌ Max stall retries reached — advancing to next item');
+        stallCountRef.current = 0;
+        goToNext();
+        return;
+      }
+
+      // Recovery: reload source and restart
+      const src = video.src;
+      video.src = '';
+      video.load();
+      video.src = src;
+      video.currentTime = 0;
+      video.play().catch(err => console.warn('[Watchdog] play() after recovery failed:', err));
+
+    }, WATCHDOG_INTERVAL_MS);
+
+    return () => clearInterval(id);
+  // Re-create watchdog when video item changes or play state changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentIndex, isPlaying, goToNext]);
 
   // ---- Scaling ----
   const scalingClass = (() => {
