@@ -116,13 +116,28 @@ export function ContentRenderer({
     // 1. In-session Map hit → instant, zero egress, zero IndexedDB round-trip
     const sessionCached = cachedUrlsRef.current.get(current.url);
     if (sessionCached) {
-      resolvedSrcRef.current = sessionCached;
-      setResolvedSrc(sessionCached);
-      console.log('[ContentRenderer] ✅ Playing from session cache:', current.url.split('/').pop());
+      // ── KEY FIX: If we're already playing this exact blob URL, do NOT call setResolvedSrc
+      // again. Calling setState with the same blob URL still triggers a re-render which
+      // briefly sets video.src and can restart the 206 stream on every quickRefresh.
+      if (resolvedSrcRef.current !== sessionCached) {
+        resolvedSrcRef.current = sessionCached;
+        setResolvedSrc(sessionCached);
+        console.log('[ContentRenderer] ✅ Playing from session cache:', current.url.split('/').pop());
+      }
       return;
     }
 
-    // 2. Set remote URL immediately so playback is never blocked
+    // ── KEY FIX: If video is already playing from a blob URL (resolvedSrcRef starts with
+    // "blob:"), do NOT reset to remote URL just because content array got a new reference
+    // (e.g. on every heartbeat quickRefresh). This was causing a new 206 stream every 60s.
+    if (resolvedSrcRef.current.startsWith('blob:')) {
+      // Blob is playing but not in session Map yet — re-store it so future calls short-circuit
+      cachedUrlsRef.current.set(current.url, resolvedSrcRef.current);
+      console.log('[ContentRenderer] 🔒 Blob already playing, skipping remote fallback:', current.url.split('/').pop());
+      return;
+    }
+
+    // 2. Set remote URL immediately so playback is never blocked (first load only)
     resolvedSrcRef.current = current.url;
     setResolvedSrc(current.url);
 
