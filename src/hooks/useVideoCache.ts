@@ -88,6 +88,11 @@ async function getCacheEntry(url: string): Promise<CacheEntry | null> {
 
 async function setCacheEntry(entry: CacheEntry): Promise<void> {
   try {
+    // Request persistence every time we write — no-op if already granted.
+    // This is the key fix for Samsung Tizen: prevents IndexedDB eviction on power-off.
+    if (navigator.storage?.persist) {
+      navigator.storage.persist().catch(() => {});
+    }
     const db = await openDB();
     await evictIfNeeded(db, entry.size);
     return new Promise((resolve) => {
