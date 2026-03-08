@@ -388,26 +388,50 @@ export default function Display() {
     return () => clearInterval(refreshInterval);
   }, [fetchData]);
 
-  // Fallback polling every 5 minutes — catches playlist changes if Realtime is silent
-  // Reduced from 30s → 5min: saves ~96% of fallback poll requests
+  // Fallback polling every 5 minutes — catches playlist changes if Realtime is silent.
+  // ── EGRESS-OPTIMIZED ──
+  // Step 1: Lightweight check — ONE query fetching only current_playlist_id + updated_at.
+  //         This replaces the old 5-query getActivePlaylistForScreen call that ran unconditionally.
+  // Step 2: Only if current_playlist_id actually changed → fire full getActivePlaylistForScreen (5 queries).
+  // Net result: ~216 polls/18h → 216 × 1 query (normal) + N × 5 queries (only on real change).
   useEffect(() => {
     if (!screen?.id) return;
     const screenId = screen.id;
 
     const poll = async () => {
       try {
+        // ── Lightweight check: single small query, ~200 bytes egress ──
+        const { data: screenRow, error } = await supabase
+          .from('screens')
+          .select('current_playlist_id, updated_at, is_playing')
+          .eq('id', screenId)
+          .single();
+
+        if (error || !screenRow) return;
+
+        // Sync play state silently
+        setIsPlaying(screenRow.is_playing ?? true);
+
+        const incomingPlaylistId = screenRow.current_playlist_id ?? null;
+        const playlistChanged    = incomingPlaylistId !== currentPlaylistIdRef.current;
+
+        if (!playlistChanged) {
+          // Nothing changed — zero extra queries, zero egress for media
+          return;
+        }
+
+        console.log('[Display] Fallback poll detected playlist change:', incomingPlaylistId);
+
+        // ── Full fetch only when something actually changed ──
         const { playlist: activePlaylist, content: playlistContent } = await getActivePlaylistForScreen(screenId);
-        const playlistChanged = activePlaylist?.id !== currentPlaylistIdRef.current;
-        if (playlistChanged) {
-          console.log('[Display] Fallback poll detected playlist change');
-          if (activePlaylist) {
-            pendingPlaylistRef.current = { playlist: activePlaylist, content: playlistContent };
-            setNewPlaylistName(activePlaylist.name);
-            setIsPlaylistTransitioning(true);
-          } else {
-            setPlaylist(null);
-            setContent([]);
-          }
+
+        if (activePlaylist) {
+          pendingPlaylistRef.current = { playlist: activePlaylist, content: playlistContent };
+          setNewPlaylistName(activePlaylist.name);
+          setIsPlaylistTransitioning(true);
+        } else {
+          setPlaylist(null);
+          setContent([]);
         }
       } catch (err) {
         console.error('[Display] Fallback poll failed:', err);
