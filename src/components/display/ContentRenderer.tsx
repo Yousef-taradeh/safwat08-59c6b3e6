@@ -280,11 +280,20 @@ export function ContentRenderer({
   // ---- Video Watchdog — detects and recovers from stall/freeze ----
   // Runs every 5 s while a video is playing.
   // Detects two types of stall:
-  //   A) readyState < HAVE_FUTURE_DATA (< 3) — browser ran out of buffered data
-  //   B) currentTime has not advanced in 5 s — "time stuck" freeze (the bug observed)
+  //   A) readyState < HAVE_FUTURE_DATA (< 3) AND time is stuck — truly stalled
+  //   B) currentTime has not advanced in 5 s AND video is not paused
   // Recovery sequence:
-  //   Attempt 1–2: reload src blob and call play()
+  //   Attempt 1–2: call play() only — NEVER reassign video.src (avoids new 206 requests)
   //   Attempt 3  : advance to next playlist item (prevents permanent black screen)
+  //
+  // CRITICAL FIX:
+  //   - We skip the first two ticks (grace period) to avoid false-stall detection at t=0
+  //     when the video is still buffering after load.
+  //   - We NEVER do `video.src = ''; video.load(); video.src = src` because:
+  //       a) It triggers a new 206 range request from Supabase Storage even for blob: URLs.
+  //       b) blob: URLs don't benefit from reloading — the data is already in memory.
+  //   - Instead we simply call video.play() which resumes stalled playback without
+  //     touching the network.
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !isPlaying) return;
@@ -293,18 +302,36 @@ export function ContentRenderer({
     lastCurrentTimeRef.current = -1;
     stallCountRef.current      = 0;
 
+    // Grace period: skip first 2 checks (~10s) while video is buffering/starting up.
+    // This prevents false-stall detection at t=0 before playback has begun.
+    let graceTicks = 2;
+
     const id = setInterval(() => {
       if (!video) return;
 
       // Ignore if the video has naturally ended or is legitimately paused
       if (video.ended || !isPlayingRef.current) return;
 
-      // Detect stall condition
-      const timeStuck       = lastCurrentTimeRef.current === video.currentTime && !video.paused;
-      const lowReadyState   = !video.paused && !video.ended && video.readyState < 3;
-      const isStalled       = timeStuck || lowReadyState;
+      // Grace period: let the video buffer before we start watching
+      if (graceTicks > 0) {
+        graceTicks--;
+        lastCurrentTimeRef.current = video.currentTime; // seed the reference
+        return;
+      }
 
-      lastCurrentTimeRef.current = video.currentTime;
+      // Detect stall condition:
+      //   - timeStuck: currentTime has not moved AND video is supposed to be playing
+      //   - Only flag as stall if BOTH timeStuck AND readyState is low;
+      //     readyState >= 3 (HAVE_FUTURE_DATA) means the browser has data but is paused
+      //     by policy — not a real stall.
+      const prevTime      = lastCurrentTimeRef.current;
+      const currTime      = video.currentTime;
+      const timeStuck     = prevTime === currTime && !video.paused;
+      const lowReadyState = !video.paused && !video.ended && video.readyState < 3;
+      // Only consider it a real stall if time is stuck AND buffer is depleted
+      const isStalled     = timeStuck && lowReadyState;
+
+      lastCurrentTimeRef.current = currTime;
 
       if (!isStalled) {
         // Healthy playback — reset stall counter
@@ -315,7 +342,7 @@ export function ContentRenderer({
       stallCountRef.current += 1;
       console.warn(
         `[Watchdog] ⚠️ Stall detected (attempt ${stallCountRef.current}/${MAX_STALL_BEFORE_SKIP})`,
-        { timeStuck, lowReadyState, readyState: video.readyState, currentTime: video.currentTime }
+        { timeStuck, lowReadyState, readyState: video.readyState, currentTime: currTime }
       );
 
       if (stallCountRef.current >= MAX_STALL_BEFORE_SKIP) {
@@ -326,13 +353,11 @@ export function ContentRenderer({
         return;
       }
 
-      // Recovery: reload source and restart
-      const src = video.src;
-      video.src = '';
-      video.load();
-      video.src = src;
-      video.currentTime = 0;
-      video.play().catch(err => console.warn('[Watchdog] play() after recovery failed:', err));
+      // Recovery: call play() ONLY — do NOT reassign video.src.
+      // Reassigning src (even to a blob:) causes the browser to emit a new range request.
+      // Simply calling play() is sufficient to resume a stalled video without network I/O.
+      console.log('[Watchdog] 🔄 Attempting recovery via play() — no src reassignment');
+      video.play().catch(err => console.warn('[Watchdog] play() recovery failed:', err));
 
     }, WATCHDOG_INTERVAL_MS);
 
