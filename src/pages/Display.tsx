@@ -12,7 +12,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'react-router-dom';
-import { updateScreenStatus } from '@/lib/api';
+import { updateScreenStatus, heartbeatAndPoll } from '@/lib/api';
 import { getActivePlaylistForScreen, getEffectiveDisplaySettings } from '@/lib/api/index';
 import { supabase } from '@/integrations/supabase/client';
 import { Screen, ContentItem, Playlist, DisplaySettings } from '@/lib/types';
@@ -329,23 +329,49 @@ export default function Display() {
     };
   }, [screen?.id, setupRealtimeSubscription]);
 
-  // Heartbeat Mechanism — every 60 seconds for accurate online/offline detection
+  // ── Combined Heartbeat + Fallback Poll ──────────────────────────────────────
+  // Single PATCH every 60 seconds that:
+  //   1) Updates last_heartbeat + status → keeps screen "online"
+  //   2) Returns current_playlist_id + is_playing in the same response
+  //      → replaces the old separate 5-min fallback GET entirely
+  // Net saving: eliminates ~216 extra queries/day per screen (was 1,296/day → now ~1,080/day)
   useEffect(() => {
     if (!screen?.id) return;
 
     const screenId = screen.id;
 
-    const heartbeat = async () => {
+    const combinedHeartbeat = async () => {
       if (!navigator.onLine) return;
       try {
-        await updateScreenStatus(screenId, 'online');
+        const result = await heartbeatAndPoll(screenId);
+        if (!result) return;
+
+        // Sync play state
+        setIsPlaying(result.isPlaying);
+
+        // Check for playlist change (same logic as old fallback poll)
+        const playlistChanged = result.currentPlaylistId !== currentPlaylistIdRef.current;
+        if (!playlistChanged) return;
+
+        console.log('[Display] Heartbeat detected playlist change:', result.currentPlaylistId);
+
+        const { playlist: activePlaylist, content: playlistContent } = await getActivePlaylistForScreen(screenId);
+
+        if (activePlaylist) {
+          pendingPlaylistRef.current = { playlist: activePlaylist, content: playlistContent };
+          setNewPlaylistName(activePlaylist.name);
+          setIsPlaylistTransitioning(true);
+        } else {
+          setPlaylist(null);
+          setContent([]);
+        }
       } catch (err) {
-        console.error('Heartbeat failed:', err);
+        console.error('[Display] Combined heartbeat failed:', err);
       }
     };
 
     const markOffline = () => {
-      // Use sendBeacon for reliable delivery even on actual page close
+      // sendBeacon for reliable delivery even on page close
       const url = `${import.meta.env.VITE_SUPABASE_URL}/rest/v1/screens?id=eq.${screenId}`;
       const body = JSON.stringify({ status: 'offline', updated_at: new Date().toISOString() });
       navigator.sendBeacon(
@@ -354,19 +380,16 @@ export default function Display() {
       );
     };
 
-    // Send immediately on mount
-    heartbeat();
+    // Fire immediately on mount
+    combinedHeartbeat();
 
-    const interval = setInterval(heartbeat, 60 * 1000); // 60 seconds
+    const interval = setInterval(combinedHeartbeat, 60 * 1000); // 60 seconds
 
-    // Mark offline ONLY when the page is truly being closed/unloaded
-    // NOT on visibilitychange (tab switch, minimize) — that causes false offline alerts
-    const handleBeforeUnload = () => markOffline();
-    window.addEventListener('beforeunload', handleBeforeUnload);
-
+    // Mark offline ONLY on true page close — NOT visibilitychange (avoids false alerts)
+    window.addEventListener('beforeunload', markOffline);
     return () => {
       clearInterval(interval);
-      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('beforeunload', markOffline);
     };
   }, [screen?.id]);
 
@@ -379,7 +402,6 @@ export default function Display() {
   }, [enterFullscreen]);
 
   // Soft refresh every 6 hours — re-fetches JSON data WITHOUT reloading media (saves egress)
-  // Reduced from 1h → 6h: saves ~120 small API requests/screen/day
   useEffect(() => {
     const refreshInterval = setInterval(() => {
       console.log('[Display] 6h soft refresh');
@@ -387,60 +409,6 @@ export default function Display() {
     }, 6 * 60 * 60 * 1000);
     return () => clearInterval(refreshInterval);
   }, [fetchData]);
-
-  // Fallback polling every 5 minutes — catches playlist changes if Realtime is silent.
-  // ── EGRESS-OPTIMIZED ──
-  // Step 1: Lightweight check — ONE query fetching only current_playlist_id + updated_at.
-  //         This replaces the old 5-query getActivePlaylistForScreen call that ran unconditionally.
-  // Step 2: Only if current_playlist_id actually changed → fire full getActivePlaylistForScreen (5 queries).
-  // Net result: ~216 polls/18h → 216 × 1 query (normal) + N × 5 queries (only on real change).
-  useEffect(() => {
-    if (!screen?.id) return;
-    const screenId = screen.id;
-
-    const poll = async () => {
-      try {
-        // ── Lightweight check: single small query, ~200 bytes egress ──
-        const { data: screenRow, error } = await supabase
-          .from('screens')
-          .select('current_playlist_id, updated_at, is_playing')
-          .eq('id', screenId)
-          .single();
-
-        if (error || !screenRow) return;
-
-        // Sync play state silently
-        setIsPlaying(screenRow.is_playing ?? true);
-
-        const incomingPlaylistId = screenRow.current_playlist_id ?? null;
-        const playlistChanged    = incomingPlaylistId !== currentPlaylistIdRef.current;
-
-        if (!playlistChanged) {
-          // Nothing changed — zero extra queries, zero egress for media
-          return;
-        }
-
-        console.log('[Display] Fallback poll detected playlist change:', incomingPlaylistId);
-
-        // ── Full fetch only when something actually changed ──
-        const { playlist: activePlaylist, content: playlistContent } = await getActivePlaylistForScreen(screenId);
-
-        if (activePlaylist) {
-          pendingPlaylistRef.current = { playlist: activePlaylist, content: playlistContent };
-          setNewPlaylistName(activePlaylist.name);
-          setIsPlaylistTransitioning(true);
-        } else {
-          setPlaylist(null);
-          setContent([]);
-        }
-      } catch (err) {
-        console.error('[Display] Fallback poll failed:', err);
-      }
-    };
-
-    const pollInterval = setInterval(poll, 5 * 60 * 1000); // 5 minutes
-    return () => clearInterval(pollInterval);
-  }, [screen?.id]);
 
 
   // Handle Playlist Transition End
