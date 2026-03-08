@@ -170,33 +170,18 @@ export async function createPlaylist(
     if (itemsError) throw itemsError;
   }
 
-  // CRITICAL: update current_playlist_id on all affected screens so the
-  // Display page receives a realtime trigger and switches immediately.
+  // CRITICAL: Deactivate old playlists for this target, then update screens
   if (activateImmediately) {
-    if (targetType === 'screen') {
-      await supabase
-        .from('screens')
-        .update({ current_playlist_id: playlist.id })
-        .eq('id', targetId);
-    } else if (targetType === 'group') {
-      // Find all screens in this group and update them
-      const { data: groupScreens } = await supabase
-        .from('screen_group_assignments')
-        .select('screen_id')
-        .eq('group_id', targetId);
-      if (groupScreens?.length) {
-        await supabase
-          .from('screens')
-          .update({ current_playlist_id: playlist.id })
-          .in('id', groupScreens.map(g => g.screen_id));
-      }
-    } else if (targetType === 'branch') {
-      // Find all screens in this branch and update them
-      await supabase
-        .from('screens')
-        .update({ current_playlist_id: playlist.id })
-        .eq('branch_id', targetId);
-    }
+    // Deactivate all other playlists for this target
+    await supabase
+      .from('playlists')
+      .update({ is_active: false })
+      .eq('target_type', targetType)
+      .eq('target_id', targetId)
+      .neq('id', playlist.id);
+
+    // Update current_playlist_id on all affected screens to fire Realtime
+    await updateAffectedScreens(targetType, targetId, playlist.id);
   }
 
   return {
@@ -296,6 +281,14 @@ export async function activatePlaylist(playlistId: string): Promise<void> {
     .single();
   
   if (fetchError) throw fetchError;
+
+  // Deactivate all other playlists for the same target first
+  await supabase
+    .from('playlists')
+    .update({ is_active: false })
+    .eq('target_type', playlistData.target_type)
+    .eq('target_id', playlistData.target_id)
+    .neq('id', playlistId);
 
   const { error } = await supabase
     .from('playlists')
