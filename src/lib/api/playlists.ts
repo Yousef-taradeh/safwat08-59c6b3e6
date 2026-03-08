@@ -170,13 +170,33 @@ export async function createPlaylist(
     if (itemsError) throw itemsError;
   }
 
-  // CRITICAL: if this playlist targets a screen, update current_playlist_id so
-  // the display page can pick it up immediately via getActivePlaylistForScreen.
-  if (activateImmediately && targetType === 'screen') {
-    await supabase
-      .from('screens')
-      .update({ current_playlist_id: playlist.id })
-      .eq('id', targetId);
+  // CRITICAL: update current_playlist_id on all affected screens so the
+  // Display page receives a realtime trigger and switches immediately.
+  if (activateImmediately) {
+    if (targetType === 'screen') {
+      await supabase
+        .from('screens')
+        .update({ current_playlist_id: playlist.id })
+        .eq('id', targetId);
+    } else if (targetType === 'group') {
+      // Find all screens in this group and update them
+      const { data: groupScreens } = await supabase
+        .from('screen_group_assignments')
+        .select('screen_id')
+        .eq('group_id', targetId);
+      if (groupScreens?.length) {
+        await supabase
+          .from('screens')
+          .update({ current_playlist_id: playlist.id })
+          .in('id', groupScreens.map(g => g.screen_id));
+      }
+    } else if (targetType === 'branch') {
+      // Find all screens in this branch and update them
+      await supabase
+        .from('screens')
+        .update({ current_playlist_id: playlist.id })
+        .eq('branch_id', targetId);
+    }
   }
 
   return {
