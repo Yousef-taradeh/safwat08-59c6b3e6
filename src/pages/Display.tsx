@@ -181,7 +181,7 @@ export default function Display() {
 
     const quickRefresh = async (showTransition = true) => {
       try {
-        console.log('Quick refreshing content...');
+        console.log('[Display] Quick refresh triggered');
         
         const { data: screenData } = await supabase
           .from('screens')
@@ -197,7 +197,7 @@ export default function Display() {
         
         const playlistChanged = activePlaylist?.id !== currentPlaylistIdRef.current;
         
-        console.log('Playlist changed:', playlistChanged, 'new:', activePlaylist?.id, 'current:', currentPlaylistIdRef.current);
+        console.log('[Display] Playlist changed:', playlistChanged, 'new:', activePlaylist?.id, 'current:', currentPlaylistIdRef.current);
         
         if (playlistChanged && showTransition && activePlaylist) {
           pendingPlaylistRef.current = { playlist: activePlaylist, content: playlistContent };
@@ -207,10 +207,23 @@ export default function Display() {
           setPlaylist(activePlaylist);
           setContent(playlistContent);
         } else {
-          setContent(playlistContent);
+          // CRITICAL: Playlist is the same — only update content if items actually changed.
+          // Calling setContent with a new array reference (even identical data) causes
+          // ContentRenderer's useEffect to re-run and can re-touch the video src.
+          // We compare by content ID + updated_at to detect real changes only.
+          setContent(prev => {
+            const prevSig = prev.map(c => `${c.id}:${c.uploadedAt?.getTime()}`).join(',');
+            const nextSig = playlistContent.map(c => `${c.id}:${c.uploadedAt?.getTime()}`).join(',');
+            if (prevSig === nextSig) {
+              console.log('[Display] Content unchanged — skipping setContent to prevent re-render');
+              return prev; // return exact same reference → no re-render
+            }
+            console.log('[Display] Content changed — updating');
+            return playlistContent;
+          });
         }
       } catch (err) {
-        console.error('Quick refresh failed:', err);
+        console.error('[Display] Quick refresh failed:', err);
       }
     };
 

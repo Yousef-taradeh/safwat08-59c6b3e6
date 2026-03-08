@@ -417,7 +417,10 @@ export async function getActivePlaylistForScreen(screenId: string): Promise<{
     thumbnailUrl: c.thumbnail_url || c.url,
     duration: c.duration,
     fileSize: Number(c.file_size),
-    uploadedAt: new Date(c.created_at),
+    // CRITICAL: use updated_at (not created_at) as the cache version key.
+    // IndexedDB compares this against the stored entry; if they match → zero egress.
+    // Using created_at meant the version never changed on content updates → cache always stale.
+    uploadedAt: new Date(c.updated_at),
   }));
 
   // Sort content by display order
