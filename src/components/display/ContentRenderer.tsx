@@ -403,23 +403,16 @@ export function ContentRenderer({
             loading="eager"
           />
         ) : (
+          // CRITICAL: videoMountKey is ONLY incremented when the content item ID changes.
+          // Does NOT change on quickRefresh content-array reference updates.
+          // preload="none" prevents Samsung Tizen / LG WebOS from auto-prefetching range chunks.
           <video
-            {/*
-              CRITICAL: videoMountKey is ONLY incremented when the content item ID changes.
-              It does NOT change on quickRefresh content-array reference updates.
-              This prevents React from re-mounting the <video> element (and opening a new
-              206 range request) on every heartbeat or soft refresh.
-            */}
             key={videoMountKey}
             ref={videoRef}
             src={resolvedSrc}
             className={cn('w-full h-full', scalingClass)}
             autoPlay
             muted
-            {/*
-              preload="none" prevents Samsung Tizen / LG WebOS from auto-prefetching
-              range chunks. The browser will load via autoPlay after src is set.
-            */}
             preload="none"
             loop={content.length === 1}
             playsInline
