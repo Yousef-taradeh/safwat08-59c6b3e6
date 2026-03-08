@@ -161,38 +161,27 @@ function cleanUrl(url: string): string {
  *   3. 24-hour TTL fallback
  */
 async function isCacheValid(
-  remoteUrl: string,
+  _remoteUrl: string,
   entry: CacheEntry,
   contentUpdatedAt?: string
 ): Promise<boolean> {
-  // ── 1. Version check via DB timestamp ──
-  // If the caller knows the file's updated_at and we stored it, compare directly.
-  // This requires ZERO network requests — pure local comparison.
+  // ── 1. Version check via DB timestamp (zero network I/O) ──
   if (contentUpdatedAt && entry.updatedAt) {
     const valid = contentUpdatedAt === entry.updatedAt;
-    if (!valid) console.log('[VideoCache] 🔄 DB version mismatch, re-downloading:', remoteUrl.split('/').pop());
+    if (!valid) console.log('[VideoCache] 🔄 DB version mismatch, re-downloading:', _remoteUrl.split('/').pop());
     return valid;
   }
 
-  // ── 2. ETag / Last-Modified via HEAD request (~200 bytes) ──
-  try {
-    const res = await fetch(remoteUrl, { method: 'HEAD' });
-    if (!res.ok) return true; // network issue → keep using cache
-
-    const remoteEtag    = res.headers.get('etag');
-    const remoteLastMod = res.headers.get('last-modified');
-
-    if (remoteEtag && entry.etag) {
-      return remoteEtag === entry.etag;
-    }
-    if (remoteLastMod && entry.lastModified) {
-      return remoteLastMod === entry.lastModified;
-    }
-  } catch {
-    return true; // on network error, use cache
+  // ── 2. contentUpdatedAt provided but not stored yet → treat as stale so we re-download
+  //       and persist updatedAt for all future checks (prevents permanent HEAD loop).
+  if (contentUpdatedAt && !entry.updatedAt) {
+    console.log('[VideoCache] 🔄 No stored updatedAt — re-downloading to persist version key:', _remoteUrl.split('/').pop());
+    return false;
   }
 
-  // ── 3. TTL fallback: treat cache as valid for 24h ──
+  // ── 3. No contentUpdatedAt available at all → SKIP HEAD request entirely.
+  //       HEAD requests to Supabase Storage count as Cached Egress and can return 400.
+  //       Use 24h TTL as the only fallback — zero network I/O.
   const cacheAgeMs = Date.now() - entry.cachedAt;
   return cacheAgeMs < 24 * 60 * 60 * 1000;
 }
