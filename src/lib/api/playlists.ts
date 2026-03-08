@@ -387,13 +387,15 @@ export async function getActivePlaylistForScreen(
     | `target_type.eq.screen,target_id.eq.${string}`
     | `target_type.eq.branch,target_id.eq.${string}`;
 
+  // CRITICAL: each group must be wrapped in and() so PostgREST treats them as
+  // (type=screen AND id=X) OR (type=branch AND id=Y) — without and(), commas
+  // inside .or() are separate OR conditions which returns ALL screen playlists.
   const orParts: string[] = [
-    `target_type.eq.screen,target_id.eq.${screenId}`,
-    `target_type.eq.branch,target_id.eq.${branchId}`,
+    `and(target_type.eq.screen,target_id.eq.${screenId})`,
+    `and(target_type.eq.branch,target_id.eq.${branchId})`,
   ];
   if (groupIds.length > 0) {
-    // PostgREST OR with IN: target_type.eq.group,target_id.in.(id1,id2,...)
-    orParts.push(`target_type.eq.group,target_id.in.(${groupIds.join(',')})`);
+    orParts.push(`and(target_type.eq.group,target_id.in.(${groupIds.join(',')}))`);
   }
 
   const { data: candidates, error: playlistError } = await supabase
