@@ -29,12 +29,18 @@ export async function getDisplaySettings(
   };
 }
 
+/**
+ * Returns the effective display settings for a screen, resolving priority:
+ * screen > group > branch > hardcoded defaults.
+ *
+ * Optimization: single OR query fetches all candidate rows in one round-trip
+ * instead of the previous 3 sequential queries (screen → each group → branch).
+ */
 export async function getEffectiveDisplaySettings(
   screenId: string,
   groupIds: string[],
   branchId: string
 ): Promise<DisplaySettings> {
-  // Default settings
   const defaults: DisplaySettings = {
     id: '',
     targetType: 'screen',
@@ -48,21 +54,41 @@ export async function getEffectiveDisplaySettings(
     updatedAt: new Date(),
   };
 
-  // Try screen settings first
-  const screenSettings = await getDisplaySettings('screen', screenId);
-  if (screenSettings) return screenSettings;
-
-  // Try group settings
-  for (const groupId of groupIds) {
-    const groupSettings = await getDisplaySettings('group', groupId);
-    if (groupSettings) return groupSettings;
+  // Build OR filter — one query covers all 3 levels simultaneously
+  const orParts: string[] = [
+    `target_type.eq.screen,target_id.eq.${screenId}`,
+    `target_type.eq.branch,target_id.eq.${branchId}`,
+  ];
+  if (groupIds.length > 0) {
+    orParts.push(`target_type.eq.group,target_id.in.(${groupIds.join(',')})`);
   }
 
-  // Try branch settings
-  const branchSettings = await getDisplaySettings('branch', branchId);
-  if (branchSettings) return branchSettings;
+  const { data: rows, error } = await supabase
+    .from('display_settings')
+    .select('*')
+    .or(orParts.join(','));
 
-  return defaults;
+  if (error) throw error;
+  if (!rows?.length) return defaults;
+
+  // Priority: screen(0) > group(1) > branch(2)
+  const PRIORITY: Record<string, number> = { screen: 0, group: 1, branch: 2 };
+  const best = rows.reduce((prev, cur) =>
+    PRIORITY[cur.target_type] < PRIORITY[prev.target_type] ? cur : prev
+  );
+
+  return {
+    id: best.id,
+    targetType: best.target_type as 'screen' | 'group' | 'branch',
+    targetId: best.target_id,
+    slideDuration: best.slide_duration,
+    transitionType: best.transition_type as 'none' | 'fade' | 'slide' | 'crossfade',
+    transitionDuration: best.transition_duration,
+    playbackOrder: best.playback_order as 'loop' | 'shuffle',
+    contentScaling: best.content_scaling as 'fit' | 'fill' | 'stretch',
+    createdAt: new Date(best.created_at),
+    updatedAt: new Date(best.updated_at),
+  };
 }
 
 export async function upsertDisplaySettings(
