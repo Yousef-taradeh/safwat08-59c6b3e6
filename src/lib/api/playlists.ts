@@ -170,6 +170,15 @@ export async function createPlaylist(
     if (itemsError) throw itemsError;
   }
 
+  // CRITICAL: if this playlist targets a screen, update current_playlist_id so
+  // the display page can pick it up immediately via getActivePlaylistForScreen.
+  if (activateImmediately && targetType === 'screen') {
+    await supabase
+      .from('screens')
+      .update({ current_playlist_id: playlist.id })
+      .eq('id', targetId);
+  }
+
   return {
     id: playlist.id,
     name: playlist.name,
