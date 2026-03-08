@@ -12,7 +12,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'react-router-dom';
-import { updateScreenStatus } from '@/lib/api';
+import { updateScreenStatus, heartbeatAndPoll } from '@/lib/api';
 import { getActivePlaylistForScreen, getEffectiveDisplaySettings } from '@/lib/api/index';
 import { supabase } from '@/integrations/supabase/client';
 import { Screen, ContentItem, Playlist, DisplaySettings } from '@/lib/types';
