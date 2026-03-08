@@ -297,6 +297,14 @@ export async function activatePlaylist(playlistId: string): Promise<void> {
   
   if (fetchError) throw fetchError;
 
+  // Deactivate all other playlists for the same target first
+  await supabase
+    .from('playlists')
+    .update({ is_active: false })
+    .eq('target_type', playlistData.target_type)
+    .eq('target_id', playlistData.target_id)
+    .neq('id', playlistId);
+
   const { error } = await supabase
     .from('playlists')
     .update({ is_active: true })
