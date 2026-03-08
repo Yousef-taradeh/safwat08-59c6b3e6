@@ -170,13 +170,33 @@ export async function createPlaylist(
     if (itemsError) throw itemsError;
   }
 
-  // CRITICAL: if this playlist targets a screen, update current_playlist_id so
-  // the display page can pick it up immediately via getActivePlaylistForScreen.
-  if (activateImmediately && targetType === 'screen') {
-    await supabase
-      .from('screens')
-      .update({ current_playlist_id: playlist.id })
-      .eq('id', targetId);
+  // CRITICAL: update current_playlist_id on all affected screens so the
+  // Display page receives a realtime trigger and switches immediately.
+  if (activateImmediately) {
+    if (targetType === 'screen') {
+      await supabase
+        .from('screens')
+        .update({ current_playlist_id: playlist.id })
+        .eq('id', targetId);
+    } else if (targetType === 'group') {
+      // Find all screens in this group and update them
+      const { data: groupScreens } = await supabase
+        .from('screen_group_assignments')
+        .select('screen_id')
+        .eq('group_id', targetId);
+      if (groupScreens?.length) {
+        await supabase
+          .from('screens')
+          .update({ current_playlist_id: playlist.id })
+          .in('id', groupScreens.map(g => g.screen_id));
+      }
+    } else if (targetType === 'branch') {
+      // Find all screens in this branch and update them
+      await supabase
+        .from('screens')
+        .update({ current_playlist_id: playlist.id })
+        .eq('branch_id', targetId);
+    }
   }
 
   return {
@@ -238,8 +258,37 @@ export async function updatePlaylist(
   }
 }
 
+// Helper: update current_playlist_id on all screens affected by a playlist
+async function updateAffectedScreens(
+  targetType: string,
+  targetId: string,
+  playlistId: string | null
+) {
+  if (targetType === 'screen') {
+    await supabase
+      .from('screens')
+      .update({ current_playlist_id: playlistId })
+      .eq('id', targetId);
+  } else if (targetType === 'group') {
+    const { data: groupScreens } = await supabase
+      .from('screen_group_assignments')
+      .select('screen_id')
+      .eq('group_id', targetId);
+    if (groupScreens?.length) {
+      await supabase
+        .from('screens')
+        .update({ current_playlist_id: playlistId })
+        .in('id', groupScreens.map(g => g.screen_id));
+    }
+  } else if (targetType === 'branch') {
+    await supabase
+      .from('screens')
+      .update({ current_playlist_id: playlistId })
+      .eq('branch_id', targetId);
+  }
+}
+
 export async function activatePlaylist(playlistId: string): Promise<void> {
-  // First, get the playlist to know its target
   const { data: playlistData, error: fetchError } = await supabase
     .from('playlists')
     .select('target_type, target_id')
@@ -248,7 +297,6 @@ export async function activatePlaylist(playlistId: string): Promise<void> {
   
   if (fetchError) throw fetchError;
 
-  // Activate the playlist (the database trigger will deactivate others)
   const { error } = await supabase
     .from('playlists')
     .update({ is_active: true })
@@ -256,17 +304,11 @@ export async function activatePlaylist(playlistId: string): Promise<void> {
   
   if (error) throw error;
 
-  // If this playlist is for a screen, update the screen's current_playlist_id
-  if (playlistData.target_type === 'screen') {
-    await supabase
-      .from('screens')
-      .update({ current_playlist_id: playlistId })
-      .eq('id', playlistData.target_id);
-  }
+  // Trigger realtime on ALL affected screens (screen / group / branch)
+  await updateAffectedScreens(playlistData.target_type, playlistData.target_id, playlistId);
 }
 
 export async function deactivatePlaylist(playlistId: string): Promise<void> {
-  // First, get the playlist to know its target
   const { data: playlistData, error: fetchError } = await supabase
     .from('playlists')
     .select('target_type, target_id')
@@ -275,7 +317,6 @@ export async function deactivatePlaylist(playlistId: string): Promise<void> {
   
   if (fetchError) throw fetchError;
 
-  // Deactivate the playlist
   const { error } = await supabase
     .from('playlists')
     .update({ is_active: false })
@@ -283,34 +324,21 @@ export async function deactivatePlaylist(playlistId: string): Promise<void> {
   
   if (error) throw error;
 
-  // If this playlist was assigned to a screen, clear the current_playlist_id
-  if (playlistData.target_type === 'screen') {
-    await supabase
-      .from('screens')
-      .update({ current_playlist_id: null })
-      .eq('id', playlistData.target_id)
-      .eq('current_playlist_id', playlistId);
-  }
+  // Clear current_playlist_id on all affected screens
+  await updateAffectedScreens(playlistData.target_type, playlistData.target_id, null);
 }
 
 export async function deletePlaylist(playlistId: string): Promise<void> {
-  // First, get the playlist to know its target
   const { data: playlistData, error: fetchError } = await supabase
     .from('playlists')
     .select('target_type, target_id')
     .eq('id', playlistId)
     .maybeSingle();
   
-  // Clear screen's current_playlist_id if this playlist was assigned to it
-  if (playlistData?.target_type === 'screen') {
-    await supabase
-      .from('screens')
-      .update({ current_playlist_id: null })
-      .eq('id', playlistData.target_id)
-      .eq('current_playlist_id', playlistId);
+  if (playlistData) {
+    await updateAffectedScreens(playlistData.target_type, playlistData.target_id, null);
   }
 
-  // Delete the playlist
   const { error } = await supabase
     .from('playlists')
     .delete()
