@@ -133,7 +133,9 @@ export default function Display() {
 
       await updateScreenStatus(screenData.id, 'online');
 
-      const { playlist: activePlaylist, content: playlistContent } = await getActivePlaylistForScreen(screenData.id);
+      // Pass already-fetched groupIds + branchId to skip redundant DB queries inside
+      const { playlist: activePlaylist, content: playlistContent } =
+        await getActivePlaylistForScreen(screenData.id, groupIds, screenData.branch_id);
       setPlaylist(activePlaylist);
       setContent(playlistContent);
 
@@ -144,6 +146,7 @@ export default function Display() {
           .eq('id', screenData.id);
       }
 
+      // Single OR query — no sequential screen→group→branch round-trips
       const effectiveSettings = await getEffectiveDisplaySettings(
         screenData.id,
         groupIds,
