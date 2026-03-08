@@ -183,6 +183,32 @@ export async function updateScreenStatus(id: string, status: 'online' | 'offline
   if (error) throw error;
 }
 
+/**
+ * Combined heartbeat + poll in a single PATCH request.
+ * Updates last_heartbeat + status AND returns current_playlist_id + is_playing
+ * from the same response — eliminating the separate 5-min fallback GET entirely.
+ * Saves ~216 queries/day per screen vs. running both operations separately.
+ */
+export async function heartbeatAndPoll(
+  id: string
+): Promise<{ currentPlaylistId: string | null; isPlaying: boolean } | null> {
+  const { data, error } = await supabase
+    .from('screens')
+    .update({ status: 'online', last_heartbeat: new Date().toISOString() })
+    .eq('id', id)
+    .select('current_playlist_id, is_playing')
+    .single();
+
+  if (error) {
+    console.error('[heartbeatAndPoll] failed:', error);
+    return null;
+  }
+  return {
+    currentPlaylistId: data.current_playlist_id ?? null,
+    isPlaying: data.is_playing ?? true,
+  };
+}
+
 export async function toggleScreenPlaying(id: string, isPlaying: boolean): Promise<void> {
   const { error } = await supabase
     .from('screens')
