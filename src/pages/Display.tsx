@@ -51,6 +51,17 @@ function ConnectionStatusIndicator({
 // ======================================
 export default function Display() {
   const { slug } = useParams<{ slug: string }>();
+
+  // ── Request persistent storage on mount ──────────────────────────────────
+  // Asks the browser (including Samsung Tizen) to NOT evict IndexedDB even
+  // after full power-off. If granted, videos survive a shutdown → zero re-download.
+  useEffect(() => {
+    if (navigator.storage?.persist) {
+      navigator.storage.persist().then((granted) => {
+        console.log('[Display] Persistent storage:', granted ? '✅ GRANTED — cache survives power-off' : '⚠️ DENIED — cache may be cleared on shutdown');
+      }).catch(() => {});
+    }
+  }, []);
   
   // Main States
   const [screen, setScreen] = useState<Screen | null>(null);
