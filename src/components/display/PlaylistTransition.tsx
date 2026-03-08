@@ -77,10 +77,10 @@ export function PlaylistTransition({
         {/* Text */}
         <div className="text-center space-y-2">
           <p className="text-sm text-muted-foreground uppercase tracking-wider">
-            جاري التحويل إلى
+            Now switching to
           </p>
           <h2 className="text-2xl font-bold text-foreground">
-            {playlistName || 'Playlist جديد'}
+            {playlistName || 'New Playlist'}
           </h2>
         </div>
 
