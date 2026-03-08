@@ -310,76 +310,78 @@ export async function deletePlaylist(playlistId: string): Promise<void> {
   if (error) throw error;
 }
 
-export async function getActivePlaylistForScreen(screenId: string): Promise<{
+/**
+ * Returns the active playlist + content for a screen.
+ *
+ * Optimization: accepts pre-fetched `knownGroupIds` and `knownBranchId` from the
+ * caller (Display.tsx `fetchData`) to skip the redundant `screens` + `screen_group_assignments`
+ * queries that were already executed there.  Falls back to fetching them when not provided
+ * (e.g. called from quickRefresh / fallback paths that don't have the data handy).
+ *
+ * Playlist resolution collapses the old 3 sequential queries (screen → group → branch)
+ * into one OR query, then picks the highest-priority result client-side.
+ * Priority: screen > group > branch
+ */
+export async function getActivePlaylistForScreen(
+  screenId: string,
+  knownGroupIds?: string[],
+  knownBranchId?: string,
+): Promise<{
   playlist: Playlist | null;
   content: ContentItem[];
 }> {
-  // Get screen to find branch and groups
-  const { data: screenData, error: screenError } = await supabase
-    .from('screens')
-    .select('*')
-    .eq('id', screenId)
-    .single();
-  
-  if (screenError) throw screenError;
+  // ── Resolve groupIds + branchId ───────────────────────────────────────────
+  // If the caller already fetched these, reuse them (saves 2 queries).
+  let groupIds: string[];
+  let branchId: string;
 
-  const { data: groupAssignments } = await supabase
-    .from('screen_group_assignments')
-    .select('group_id')
-    .eq('screen_id', screenId);
+  if (knownGroupIds !== undefined && knownBranchId !== undefined) {
+    groupIds = knownGroupIds;
+    branchId = knownBranchId;
+  } else {
+    const [{ data: screenData, error: screenError }, { data: groupAssignments }] =
+      await Promise.all([
+        supabase.from('screens').select('branch_id').eq('id', screenId).single(),
+        supabase.from('screen_group_assignments').select('group_id').eq('screen_id', screenId),
+      ]);
 
-  const groupIds = groupAssignments?.map(a => a.group_id) || [];
+    if (screenError) throw screenError;
+    groupIds = groupAssignments?.map(a => a.group_id) || [];
+    branchId = screenData.branch_id;
+  }
 
-  // Check for active playlist at screen level first, then group, then branch
-  let activePlaylist = null;
+  // ── Single OR query across all 3 levels ──────────────────────────────────
+  // Build a filter that fetches ALL potentially-active playlists in one round-trip,
+  // then select the highest-priority one client-side.
+  type OrFilter =
+    | `target_type.eq.screen,target_id.eq.${string}`
+    | `target_type.eq.branch,target_id.eq.${string}`;
 
-  // Screen level
-  const { data: screenPlaylist } = await supabase
+  const orParts: string[] = [
+    `target_type.eq.screen,target_id.eq.${screenId}`,
+    `target_type.eq.branch,target_id.eq.${branchId}`,
+  ];
+  if (groupIds.length > 0) {
+    // PostgREST OR with IN: target_type.eq.group,target_id.in.(id1,id2,...)
+    orParts.push(`target_type.eq.group,target_id.in.(${groupIds.join(',')})`);
+  }
+
+  const { data: candidates, error: playlistError } = await supabase
     .from('playlists')
     .select('*')
-    .eq('target_type', 'screen')
-    .eq('target_id', screenId)
     .eq('is_active', true)
-    .maybeSingle();
+    .or(orParts.join(','));
 
-  if (screenPlaylist) {
-    activePlaylist = screenPlaylist;
-  } else if (groupIds.length > 0) {
-    // Group level
-    const { data: groupPlaylist } = await supabase
-      .from('playlists')
-      .select('*')
-      .eq('target_type', 'group')
-      .in('target_id', groupIds)
-      .eq('is_active', true)
-      .limit(1)
-      .maybeSingle();
-    
-    if (groupPlaylist) {
-      activePlaylist = groupPlaylist;
-    }
-  }
+  if (playlistError) throw playlistError;
+  if (!candidates?.length) return { playlist: null, content: [] };
 
-  if (!activePlaylist) {
-    // Branch level
-    const { data: branchPlaylist } = await supabase
-      .from('playlists')
-      .select('*')
-      .eq('target_type', 'branch')
-      .eq('target_id', screenData.branch_id)
-      .eq('is_active', true)
-      .maybeSingle();
-    
-    if (branchPlaylist) {
-      activePlaylist = branchPlaylist;
-    }
-  }
+  // Priority: screen > group > branch
+  const PRIORITY: Record<string, number> = { screen: 0, group: 1, branch: 2 };
+  const activePlaylist = candidates.reduce((best, cur) =>
+    PRIORITY[cur.target_type] < PRIORITY[best.target_type] ? cur : best
+  );
 
-  if (!activePlaylist) {
-    return { playlist: null, content: [] };
-  }
-
-  // Get playlist items
+  // ── Fetch items + content in parallel ────────────────────────────────────
   const { data: itemsData } = await supabase
     .from('playlist_items')
     .select('*')
@@ -387,7 +389,7 @@ export async function getActivePlaylistForScreen(screenId: string): Promise<{
     .order('display_order', { ascending: true });
 
   if (!itemsData?.length) {
-    return { 
+    return {
       playlist: {
         id: activePlaylist.id,
         name: activePlaylist.name,
@@ -397,37 +399,39 @@ export async function getActivePlaylistForScreen(screenId: string): Promise<{
         items: [],
         createdAt: new Date(activePlaylist.created_at),
         updatedAt: new Date(activePlaylist.updated_at),
-      }, 
-      content: [] 
+      },
+      content: [],
     };
   }
 
-  // Get content for items
   const contentIds = itemsData.map(i => i.content_id);
   const { data: contentData } = await supabase
     .from('content')
     .select('*')
     .in('id', contentIds);
 
-  const content: ContentItem[] = (contentData || []).map(c => ({
-    id: c.id,
-    name: c.name,
-    type: c.type as 'image' | 'video',
-    url: c.url,
-    thumbnailUrl: c.thumbnail_url || c.url,
-    duration: c.duration,
-    fileSize: Number(c.file_size),
-    // CRITICAL: use updated_at (not created_at) as the cache version key.
-    // IndexedDB compares this against the stored entry; if they match → zero egress.
-    // Using created_at meant the version never changed on content updates → cache always stale.
-    uploadedAt: new Date(c.updated_at),
-  }));
+  const contentMap = new Map((contentData || []).map(c => [c.id, c]));
 
-  // Sort content by display order
-  const orderedContent = itemsData.map(item => {
-    const contentItem = content.find(c => c.id === item.content_id);
-    return contentItem ? { ...contentItem, duration: item.duration } : null;
-  }).filter(Boolean) as ContentItem[];
+  // Sort content by display order and map to ContentItem
+  const orderedContent = itemsData
+    .map(item => {
+      const c = contentMap.get(item.content_id);
+      if (!c) return null;
+      return {
+        id: c.id,
+        name: c.name,
+        type: c.type as 'image' | 'video',
+        url: c.url,
+        thumbnailUrl: c.thumbnail_url || c.url,
+        // Use item-level duration so per-item overrides are respected
+        duration: item.duration,
+        fileSize: Number(c.file_size),
+        // CRITICAL: use updated_at as cache version key (not created_at).
+        // IndexedDB compares this; match → zero egress re-download.
+        uploadedAt: new Date(c.updated_at),
+      } as ContentItem;
+    })
+    .filter(Boolean) as ContentItem[];
 
   return {
     playlist: {
