@@ -252,7 +252,9 @@ export default function Display() {
             return;
           }
           
-          if (updated.current_playlist_id !== playlist?.id) {
+          // Use ref (not playlist state) to avoid this callback being stale or
+          // causing setupRealtimeSubscription to re-run when playlist changes.
+          if (updated.current_playlist_id !== currentPlaylistIdRef.current) {
             quickRefresh();
           }
         }
