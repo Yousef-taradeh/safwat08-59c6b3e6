@@ -305,7 +305,11 @@ export default function Display() {
       });
 
     channelRef.current = channel;
-  }, [screen?.id, playlist?.id, fetchData, resetAttempts]);
+  // CRITICAL: playlist?.id is intentionally NOT in deps.
+  // Using currentPlaylistIdRef inside the closure avoids recreating the channel
+  // every time the playlist changes, which was triggering extra quickRefresh calls.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen?.id, fetchData, resetAttempts]);
 
   // Initial Fetch
   useEffect(() => {
