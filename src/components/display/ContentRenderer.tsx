@@ -1,40 +1,32 @@
 /**
  * ======================================
- * Content Renderer — Lag-Free + Watchdog Edition
+ * Content Renderer — Zero-Egress Edition
  * ======================================
  *
- * Bug fixes preserved:
- *   1. Race condition: setTimeout + onEnded both calling goToNext → double transition
- *      Fix: isTransitioningRef guard — only ONE transition can be in-flight at a time
- *   2. Content refresh resets currentIndex to 0 mid-playback
- *      Fix: preserve current URL across content array updates via currentUrlRef
- *   3. nextVideoRef preload="auto" starving bandwidth from current video
- *      Fix: next-video element removed — only current video is loaded at a time
- *   4. Pause event listener re-attaches on every render
- *      Fix: attach once via ref, re-attach only on content-type switch
+ * CRITICAL ARCHITECTURE — why every decision matters for egress:
  *
- * Egress optimizations:
- *   5. All video URLs are cleaned of query-string cache-busters before caching
- *   6. Cache validation uses content.updatedAt (DB version) — no HEAD request needed
- *   7. Only the CURRENT video is resolved via IndexedDB; next video loads on-demand
- *      after the transition completes, preventing bandwidth race conditions
- *   8. In-flight deduplication in getVideoBlobUrl prevents concurrent duplicate downloads
+ * 1. `key` on <video>: MUST be stable per content item ID.
+ *    Using `key={currentContent.id}` was WRONG — when the content array gets a new
+ *    reference (quickRefresh), React sees a new prop object and re-mounts the element,
+ *    causing the browser to open a new 206 range request even if src hasn't changed.
+ *    FIX: use `videoMountKey` which ONLY increments when the actual item ID changes.
  *
- * Video Watchdog (added for 20h+ runtime stability):
- *   9. Checks every 5 seconds that currentTime is advancing
- *  10. Detects stall/freeze: paused=false, ended=false, readyState<3 OR currentTime stuck
- *  11. On stall: reloads src and restarts playback without triggering a playlist transition
- *  12. Max 3 consecutive recovery attempts before advancing to next item (safety valve)
- *  13. Compatible with Samsung Smart TV (Tizen) and Android TV browsers
+ * 2. `src` fallback: MUST NOT fall back to remote URL while blob is loading.
+ *    `src={resolvedSrc || currentContent.url}` was WRONG — when resolvedSrc='' during
+ *    the IndexedDB async lookup, the video briefly pointed to the remote URL.
+ *    FIX: initialize resolvedSrc to remote URL synchronously in the effect, use only
+ *    resolvedSrc in the JSX with no fallback.
  *
- * Critical bug fix (v4) — "video canceled mid-playback":
- *  14. PROBLEM: When IndexedDB finishes caching a blob, setCachedUrlsVersion triggers a
- *      re-render. resolveUrl then returns the NEW blob URL, changing <video src> while
- *      the remote stream is active → browser cancels the in-flight request → readyState
- *      drops → Watchdog detects stall → recovery loop begins.
- *      FIX: resolvedSrcRef stores the src that was committed at the START of each index.
- *      cachedUrlsVersion changes NEVER update the video src mid-playback — the blob URL
- *      is only applied on the NEXT time this currentIndex is rendered (after a loop).
+ * 3. `preload="none"` MUST be set explicitly on the <video> element.
+ *    Samsung Tizen / LG WebOS default to 'auto' and will prefetch range chunks
+ *    even from blob: URLs if preload is unset.
+ *
+ * 4. Watchdog MUST NEVER call video.load() or reassign video.src.
+ *    Even blob: src reassignment causes the browser to re-open the stream.
+ *    Recovery = video.play() ONLY.
+ *
+ * 5. Watchdog useEffect dep uses `videoMountKey` not `currentIndex`.
+ *    This prevents the watchdog from being recreated on content-array refreshes.
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
@@ -43,9 +35,9 @@ import { cn } from '@/lib/utils';
 import { getVideoBlobUrl, isIndexedDBSupported } from '@/hooks/useVideoCache';
 
 interface ContentRendererProps {
-  content:         ContentItem[];
-  settings:        DisplaySettings;
-  isPlaying:       boolean;
+  content:          ContentItem[];
+  settings:         DisplaySettings;
+  isPlaying:        boolean;
   onContentChange?: (index: number) => void;
 }
 
@@ -57,7 +49,7 @@ export function ContentRenderer({
 }: ContentRendererProps) {
 
   // ---- indexes ----
-  const [currentIndex, setCurrentIndex]     = useState(0);
+  const [currentIndex, setCurrentIndex]       = useState(0);
   const [isTransitioning, setIsTransitioning] = useState(false);
 
   // Guard: prevents double-fire from setTimeout + onEnded race condition
@@ -75,32 +67,27 @@ export function ContentRenderer({
   const cachedUrlsRef = useRef<Map<string, string>>(new Map());
 
   // ── resolvedSrcRef: the src COMMITTED to <video> at the start of each index.
-  // This is the ONLY value used in the render. It is set once per currentIndex
-  // change and NEVER updated by cache events — preventing mid-playback src swaps
-  // that cause the browser to cancel the in-flight request (the "canceled" bug).
+  // NEVER updated mid-playback. Cache events update cachedUrlsRef only.
   const resolvedSrcRef = useRef<string>('');
   const [resolvedSrc, setResolvedSrc] = useState<string>('');
 
-  // Video element refs
+  // ── videoMountKey: ONLY increments when the content item ID actually changes.
+  // This prevents React from re-mounting the video on quickRefresh content-array
+  // reference changes, which would open a new 206 range request per heartbeat.
+  const videoMountKeyRef  = useRef<number>(0);
+  const lastMountedIdRef  = useRef<string>('');
+  const [videoMountKey, setVideoMountKey] = useState<number>(0);
+
+  // Video element ref
   const videoRef = useRef<HTMLVideoElement>(null);
 
   // ── Watchdog refs ──
-  // Tracks last known currentTime to detect a "time stuck" stall
-  const lastCurrentTimeRef   = useRef<number>(-1);
-  // Counts consecutive stall detections to cap recovery attempts
-  const stallCountRef        = useRef<number>(0);
-  const WATCHDOG_INTERVAL_MS = 5000;  // check every 5 s
-  const MAX_STALL_BEFORE_SKIP = 3;    // after 3 failed recoveries → skip to next item
+  const lastCurrentTimeRef    = useRef<number>(-1);
+  const stallCountRef         = useRef<number>(0);
+  const WATCHDOG_INTERVAL_MS  = 5000;
+  const MAX_STALL_BEFORE_SKIP = 3;
 
   // ---- Resolve src for CURRENT video when index changes ----
-  // Flow:
-  //   a) Check in-session Map first (instant, already a blob URL).
-  //   b) If NOT in session Map → ask IndexedDB immediately (survives page reload!).
-  //      While waiting, set remote URL so playback can start without blocking.
-  //   c) If IndexedDB returns a blob → use it immediately (overrides remote URL)
-  //      ONLY if the video hasn't already started playing from a different src.
-  //   d) Store blob in session Map so next cycle is instant.
-  //   NEVER swap src after the video has committed to playing (prevents "canceled" bug).
   useEffect(() => {
     if (content.length === 0) return;
 
@@ -111,14 +98,19 @@ export function ContentRenderer({
 
     if (!current || current.type !== 'video') return;
 
+    // ── Update stable mount key ONLY when the actual video item ID changes.
+    // Does NOT change when the content array gets a new reference (quickRefresh).
+    if (lastMountedIdRef.current !== current.id) {
+      lastMountedIdRef.current    = current.id;
+      videoMountKeyRef.current   += 1;
+      setVideoMountKey(videoMountKeyRef.current);
+    }
+
     let cancelled = false;
 
     // 1. In-session Map hit → instant, zero egress, zero IndexedDB round-trip
     const sessionCached = cachedUrlsRef.current.get(current.url);
     if (sessionCached) {
-      // ── KEY FIX: If we're already playing this exact blob URL, do NOT call setResolvedSrc
-      // again. Calling setState with the same blob URL still triggers a re-render which
-      // briefly sets video.src and can restart the 206 stream on every quickRefresh.
       if (resolvedSrcRef.current !== sessionCached) {
         resolvedSrcRef.current = sessionCached;
         setResolvedSrc(sessionCached);
@@ -127,11 +119,9 @@ export function ContentRenderer({
       return;
     }
 
-    // ── KEY FIX: If video is already playing from a blob URL (resolvedSrcRef starts with
-    // "blob:"), do NOT reset to remote URL just because content array got a new reference
-    // (e.g. on every heartbeat quickRefresh). This was causing a new 206 stream every 60s.
+    // ── KEY FIX: If video is already playing from a blob URL, do NOT reset to remote URL.
+    // This prevents a new 206 stream every time the content array gets a new reference.
     if (resolvedSrcRef.current.startsWith('blob:')) {
-      // Blob is playing but not in session Map yet — re-store it so future calls short-circuit
       cachedUrlsRef.current.set(current.url, resolvedSrcRef.current);
       console.log('[ContentRenderer] 🔒 Blob already playing, skipping remote fallback:', current.url.split('/').pop());
       return;
@@ -143,16 +133,14 @@ export function ContentRenderer({
 
     if (!isIndexedDBSupported()) return;
 
-    // 3. Query IndexedDB — this survives page refresh unlike the session Map
+    // 3. Query IndexedDB — survives page refresh unlike the session Map
     const updatedAt = current.uploadedAt?.toISOString();
     getVideoBlobUrl(current.url, updatedAt).then(blobUrl => {
       if (cancelled || blobUrl === current.url) return;
 
-      // Store in session Map for all future cycles
       cachedUrlsRef.current.set(current.url, blobUrl);
 
       // Apply immediately ONLY if no playback has started yet for this index
-      // (i.e. the video element src is still the remote URL — hasn't been committed)
       const video = videoRef.current;
       const isUnstarted = !video || video.currentTime === 0 || video.readyState === 0;
       if (isUnstarted) {
@@ -169,8 +157,6 @@ export function ContentRenderer({
   }, [currentIndex, content, displayOrder]);
 
   // ---- Initialize / re-initialize display order ----
-  // When content array changes (soft refresh), try to preserve the currently-playing
-  // item so the video doesn't restart from the beginning.
   useEffect(() => {
     if (content.length === 0) return;
 
@@ -183,7 +169,6 @@ export function ContentRenderer({
       }
     }
 
-    // Try to find the currently-playing item in the new content array
     const currentUrl = currentUrlRef.current;
     let newCurrentIndex = 0;
     if (currentUrl) {
@@ -197,7 +182,6 @@ export function ContentRenderer({
   }, [content, settings.playbackOrder]);
 
   // ---- Core transition function ----
-  // Uses a ref-based lock so it can NEVER fire twice simultaneously
   const goToNext = useCallback(() => {
     const orderLen = displayOrder.length || content.length;
     if (orderLen <= 1 || !isPlaying) return;
@@ -213,14 +197,11 @@ export function ContentRenderer({
         return next;
       });
       setIsTransitioning(false);
-      // Release lock AFTER state updates settle
       setTimeout(() => { isTransitioningRef.current = false; }, 50);
     }, settings.transitionDuration);
   }, [content.length, displayOrder.length, settings.transitionDuration, isPlaying, onContentChange]);
 
   // ---- Auto-advance timer for images (and videos as fallback) ----
-  // For videos: onEnded is the primary trigger. setTimeout is only a safety fallback
-  // and is blocked by the isTransitioningRef lock if onEnded already fired.
   useEffect(() => {
     if (content.length === 0 || !isPlaying) return;
 
@@ -231,12 +212,10 @@ export function ContentRenderer({
 
     if (!current) return;
 
-    // Track what's currently playing (used for position-preservation on refresh)
     currentUrlRef.current = current.url;
 
-    // For videos: rely on onEnded — only set a fallback timer (duration + 2s buffer)
-    const isVideo     = current.type === 'video';
-    const baseDuration = (current.duration || settings.slideDuration) * 1000;
+    const isVideo       = current.type === 'video';
+    const baseDuration  = (current.duration || settings.slideDuration) * 1000;
     const timerDuration = isVideo ? baseDuration + 2000 : baseDuration;
 
     const timer = setTimeout(goToNext, timerDuration);
@@ -248,14 +227,12 @@ export function ContentRenderer({
     if (content.length > 1) {
       goToNext();
     } else if (videoRef.current) {
-      // Single video — just loop it
       videoRef.current.currentTime = 0;
       videoRef.current.play().catch(console.error);
     }
   }, [content.length, goToNext]);
 
   // ---- Auto-resume if TV remote pauses the video ----
-  // Attached directly to the element via ref — does NOT re-attach on every render
   const isPlayingRef = useRef(isPlaying);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
 
@@ -273,68 +250,45 @@ export function ContentRenderer({
 
     video.addEventListener('pause', handlePause);
     return () => video.removeEventListener('pause', handlePause);
-  // Re-attach only when the video element changes (i.e. content type switch)
+  // Re-attach only when the video element is actually remounted (item ID changed)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentIndex]);
+  }, [videoMountKey]);
 
   // ---- Video Watchdog — detects and recovers from stall/freeze ----
-  // Runs every 5 s while a video is playing.
-  // Detects two types of stall:
-  //   A) readyState < HAVE_FUTURE_DATA (< 3) AND time is stuck — truly stalled
-  //   B) currentTime has not advanced in 5 s AND video is not paused
-  // Recovery sequence:
-  //   Attempt 1–2: call play() only — NEVER reassign video.src (avoids new 206 requests)
-  //   Attempt 3  : advance to next playlist item (prevents permanent black screen)
-  //
-  // CRITICAL FIX:
-  //   - We skip the first two ticks (grace period) to avoid false-stall detection at t=0
-  //     when the video is still buffering after load.
-  //   - We NEVER do `video.src = ''; video.load(); video.src = src` because:
-  //       a) It triggers a new 206 range request from Supabase Storage even for blob: URLs.
-  //       b) blob: URLs don't benefit from reloading — the data is already in memory.
-  //   - Instead we simply call video.play() which resumes stalled playback without
-  //     touching the network.
+  // CRITICAL: NEVER call video.load() or reassign video.src inside this watchdog.
+  // Even reassigning a blob: src causes the browser to re-open the stream and
+  // can trigger a new 206 range request from Supabase Storage.
+  // Recovery = video.play() ONLY.
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !isPlaying) return;
 
-    // Reset tracking when the video source changes (new item starts)
     lastCurrentTimeRef.current = -1;
     stallCountRef.current      = 0;
 
-    // Grace period: skip first 2 checks (~10s) while video is buffering/starting up.
-    // This prevents false-stall detection at t=0 before playback has begun.
+    // Grace period: skip first 2 checks (~10s) while video is buffering/starting up
     let graceTicks = 2;
 
     const id = setInterval(() => {
       if (!video) return;
-
-      // Ignore if the video has naturally ended or is legitimately paused
       if (video.ended || !isPlayingRef.current) return;
 
-      // Grace period: let the video buffer before we start watching
       if (graceTicks > 0) {
         graceTicks--;
-        lastCurrentTimeRef.current = video.currentTime; // seed the reference
+        lastCurrentTimeRef.current = video.currentTime;
         return;
       }
 
-      // Detect stall condition:
-      //   - timeStuck: currentTime has not moved AND video is supposed to be playing
-      //   - Only flag as stall if BOTH timeStuck AND readyState is low;
-      //     readyState >= 3 (HAVE_FUTURE_DATA) means the browser has data but is paused
-      //     by policy — not a real stall.
       const prevTime      = lastCurrentTimeRef.current;
       const currTime      = video.currentTime;
       const timeStuck     = prevTime === currTime && !video.paused;
       const lowReadyState = !video.paused && !video.ended && video.readyState < 3;
-      // Only consider it a real stall if time is stuck AND buffer is depleted
+      // Only flag stall if BOTH time is stuck AND buffer is depleted
       const isStalled     = timeStuck && lowReadyState;
 
       lastCurrentTimeRef.current = currTime;
 
       if (!isStalled) {
-        // Healthy playback — reset stall counter
         stallCountRef.current = 0;
         return;
       }
@@ -346,25 +300,22 @@ export function ContentRenderer({
       );
 
       if (stallCountRef.current >= MAX_STALL_BEFORE_SKIP) {
-        // Failed multiple recovery attempts — skip to next item
-        console.error('[Watchdog] ❌ Max stall retries reached — advancing to next item');
+        console.error('[Watchdog] ❌ Max stall retries — advancing to next item');
         stallCountRef.current = 0;
         goToNext();
         return;
       }
 
-      // Recovery: call play() ONLY — do NOT reassign video.src.
-      // Reassigning src (even to a blob:) causes the browser to emit a new range request.
-      // Simply calling play() is sufficient to resume a stalled video without network I/O.
-      console.log('[Watchdog] 🔄 Attempting recovery via play() — no src reassignment');
-      video.play().catch(err => console.warn('[Watchdog] play() recovery failed:', err));
+      // SAFE recovery: play() only — no src reassignment, no load()
+      console.log('[Watchdog] 🔄 Recovery via play() only — zero network I/O');
+      video.play().catch(err => console.warn('[Watchdog] play() failed:', err));
 
     }, WATCHDOG_INTERVAL_MS);
 
     return () => clearInterval(id);
-  // Re-create watchdog when video item changes or play state changes
+  // Dep on videoMountKey (not currentIndex) — watchdog only recreates on real item change
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentIndex, isPlaying, goToNext]);
+  }, [videoMountKey, isPlaying, goToNext]);
 
   // ---- Scaling ----
   const scalingClass = (() => {
@@ -414,8 +365,19 @@ export function ContentRenderer({
       <div className="absolute inset-0 overflow-hidden bg-black">
         {fb.type === 'image'
           ? <img src={fb.url} alt={fb.name} className="w-full h-full object-cover" />
-          : <video src={fb.url} className="w-full h-full object-cover" autoPlay muted loop playsInline
-              controls={false} disablePictureInPicture disableRemotePlayback style={{ pointerEvents: 'none' }} />
+          : <video
+              src={fb.url}
+              className="w-full h-full object-cover"
+              autoPlay
+              muted
+              loop
+              playsInline
+              preload="none"
+              controls={false}
+              disablePictureInPicture
+              disableRemotePlayback
+              style={{ pointerEvents: 'none' }}
+            />
         }
       </div>
     );
@@ -424,7 +386,7 @@ export function ContentRenderer({
   const transitionStyles = getTransitionStyles();
 
   // ---- Next item index (for progress dots only — NOT preloaded) ----
-  const nextIndex     = (currentIndex + 1) % effectiveOrder.length;
+  const nextIndex      = (currentIndex + 1) % effectiveOrder.length;
   const nextContentIdx = effectiveOrder[nextIndex] ?? 0;
   const nextContent    = content[nextContentIdx];
 
@@ -441,14 +403,17 @@ export function ContentRenderer({
             loading="eager"
           />
         ) : (
+          // CRITICAL: videoMountKey is ONLY incremented when the content item ID changes.
+          // Does NOT change on quickRefresh content-array reference updates.
+          // preload="none" prevents Samsung Tizen / LG WebOS from auto-prefetching range chunks.
           <video
-            key={currentContent.id}
+            key={videoMountKey}
             ref={videoRef}
-            src={resolvedSrc || currentContent.url}
+            src={resolvedSrc}
             className={cn('w-full h-full', scalingClass)}
             autoPlay
             muted
-            // Never use loop when there are multiple items — onEnded handles transition
+            preload="none"
             loop={content.length === 1}
             playsInline
             controls={false}
@@ -457,22 +422,17 @@ export function ContentRenderer({
             disableRemotePlayback
             onEnded={handleVideoEnded}
             onContextMenu={e => e.preventDefault()}
-            onError={e => console.error('[Video] load error:', e)}
+            onError={e => console.error('[Video] error:', (e.target as HTMLVideoElement).error)}
             style={{ pointerEvents: 'none' }}
           />
         )}
       </div>
 
       {/* ── Next Content — shown only for slide/crossfade transitions ── */}
-      {/* NOTE: We do NOT preload next video here to avoid egress during initial load.  */}
-      {/* The next video blob is resolved on-demand in the useEffect above              */}
-      {/* after currentIndex advances, so bandwidth is never split between two videos.  */}
+      {/* NOTE: We do NOT preload next video to avoid egress during current playback. */}
       {content.length > 1 && nextContent && nextContent.id !== currentContent.id &&
         (settings.transitionType === 'slide' || settings.transitionType === 'crossfade') && (
-        <div
-          className="absolute inset-0"
-          style={transitionStyles.next}
-        >
+        <div className="absolute inset-0" style={transitionStyles.next}>
           {nextContent.type === 'image' ? (
             <img
               src={nextContent.url}
@@ -481,8 +441,7 @@ export function ContentRenderer({
               loading="lazy"
             />
           ) : (
-            // For video transitions, show a black frame — the actual video will start
-            // playing after currentIndex advances and the blob URL is resolved
+            // Black frame placeholder — actual video starts after currentIndex advances
             <div className="w-full h-full bg-black" />
           )}
         </div>

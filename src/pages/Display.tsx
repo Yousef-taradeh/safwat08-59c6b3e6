@@ -252,7 +252,9 @@ export default function Display() {
             return;
           }
           
-          if (updated.current_playlist_id !== playlist?.id) {
+          // Use ref (not playlist state) to avoid this callback being stale or
+          // causing setupRealtimeSubscription to re-run when playlist changes.
+          if (updated.current_playlist_id !== currentPlaylistIdRef.current) {
             quickRefresh();
           }
         }
@@ -303,7 +305,11 @@ export default function Display() {
       });
 
     channelRef.current = channel;
-  }, [screen?.id, playlist?.id, fetchData, resetAttempts]);
+  // CRITICAL: playlist?.id is intentionally NOT in deps.
+  // Using currentPlaylistIdRef inside the closure avoids recreating the channel
+  // every time the playlist changes, which was triggering extra quickRefresh calls.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen?.id, fetchData, resetAttempts]);
 
   // Initial Fetch
   useEffect(() => {
