@@ -193,6 +193,13 @@ export default function Display() {
       supabase.removeChannel(channelRef.current);
     }
 
+    // Debounce: prevent concurrent quickRefresh calls (race condition → caches wrong videos)
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedRefresh = (showTransition = true) => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => quickRefresh(showTransition), 300);
+    };
+
     const quickRefresh = async (showTransition = true) => {
       try {
         console.log('[Display] Quick refresh triggered');
@@ -212,6 +219,7 @@ export default function Display() {
         const playlistChanged = activePlaylist?.id !== currentPlaylistIdRef.current;
         
         console.log('[Display] Playlist changed:', playlistChanged, 'new:', activePlaylist?.id, 'current:', currentPlaylistIdRef.current);
+        console.log('[Display] Active playlist content count:', playlistContent.length, playlistContent.map(c => c.name));
         
         if (playlistChanged && showTransition && activePlaylist) {
           pendingPlaylistRef.current = { playlist: activePlaylist, content: playlistContent };
@@ -275,18 +283,29 @@ export default function Display() {
       )
       .on(
         'postgres_changes',
+        // Filter to only playlists targeting this screen's branch — avoids triggering
+        // on unrelated playlist changes in the system
         { event: '*', schema: 'public', table: 'playlists' },
-        () => {
-          console.log('Playlists changed');
-          quickRefresh();
+        (payload) => {
+          const changed = (payload.new || payload.old) as any;
+          // Only refresh if the changed playlist is relevant to this screen
+          // (target is this screen, or a group/branch — we can't filter groups easily so
+          //  we accept group/branch changes but skip screen-targeted playlists for other screens)
+          if (changed?.target_type === 'screen' && changed?.target_id !== screen.id) {
+            console.log('[Display] Ignoring playlist change for different screen');
+            return;
+          }
+          console.log('[Display] Relevant playlist changed');
+          debouncedRefresh();
         }
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'playlist_items' },
         () => {
-          console.log('Playlist items changed');
-          quickRefresh();
+          // playlist_items don't carry target info — debounce to avoid rapid-fire refreshes
+          console.log('[Display] Playlist items changed');
+          debouncedRefresh();
         }
       )
       .on(
@@ -297,14 +316,10 @@ export default function Display() {
           fetchData();
         }
       )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'content' },
-        () => {
-          console.log('Content changed');
-          quickRefresh();
-        }
-      )
+      // NOTE: Removed global 'content' table listener — it was triggering quickRefresh
+      // for ANY content change in the system (uploads, deletes from other screens),
+      // which caused IndexedDB to attempt caching unrelated videos.
+      // Content changes are already caught via playlist_items updates.
       .subscribe((status, err) => {
         console.log('Subscription status:', status);
         
