@@ -127,30 +127,41 @@ export function ContentRenderer({
       return;
     }
 
-    // 2. Set remote URL immediately so playback is never blocked (first load only)
-    resolvedSrcRef.current = current.url;
-    setResolvedSrc(current.url);
+    if (!isIndexedDBSupported()) {
+      // No IndexedDB — use remote URL directly
+      resolvedSrcRef.current = current.url;
+      setResolvedSrc(current.url);
+      return;
+    }
 
-    if (!isIndexedDBSupported()) return;
-
-    // 3. Query IndexedDB — survives page refresh unlike the session Map
+    // 2. Query IndexedDB FIRST — zero-egress path.
+    //    We do NOT set remote URL here yet to avoid triggering a 206 range request
+    //    before the blob lookup completes. The video element stays blank (<1s) until
+    //    the blob is ready. If IndexedDB misses, we fall back to remote URL.
     const updatedAt = current.uploadedAt?.toISOString();
+
+    // Set a loading sentinel so we don't re-enter this branch on re-render
+    resolvedSrcRef.current = '__loading__';
+
     getVideoBlobUrl(current.url, updatedAt).then(blobUrl => {
-      if (cancelled || blobUrl === current.url) return;
+      if (cancelled) return;
 
-      cachedUrlsRef.current.set(current.url, blobUrl);
+      const srcToUse = blobUrl !== current.url ? blobUrl : current.url;
+      cachedUrlsRef.current.set(current.url, srcToUse);
+      resolvedSrcRef.current = srcToUse;
+      setResolvedSrc(srcToUse);
 
-      // Apply immediately ONLY if no playback has started yet for this index
-      const video = videoRef.current;
-      const isUnstarted = !video || video.currentTime === 0 || video.readyState === 0;
-      if (isUnstarted) {
-        resolvedSrcRef.current = blobUrl;
-        setResolvedSrc(blobUrl);
-        console.log('[ContentRenderer] ✅ Playing from IndexedDB (page-refresh hit):', current.url.split('/').pop());
+      if (blobUrl !== current.url) {
+        console.log('[ContentRenderer] ✅ Playing from IndexedDB (zero egress):', current.url.split('/').pop());
       } else {
-        console.log('[ContentRenderer] 🗄️ Blob cached for next cycle:', current.url.split('/').pop());
+        console.log('[ContentRenderer] ⬇️ IndexedDB miss — falling back to remote URL:', current.url.split('/').pop());
       }
-    }).catch(() => {});
+    }).catch(() => {
+      if (cancelled) return;
+      // IndexedDB threw — safe fallback to remote
+      resolvedSrcRef.current = current.url;
+      setResolvedSrc(current.url);
+    });
 
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
