@@ -290,6 +290,38 @@ export async function activatePlaylist(playlistId: string): Promise<void> {
     .eq('target_id', playlistData.target_id)
     .neq('id', playlistId);
 
+  // CRITICAL: When activating a group or branch playlist, deactivate any screen-level
+  // playlists for the affected screens. Screen-level playlists take priority in
+  // getActivePlaylistForScreen (screen > group > branch), so if any screen-level
+  // playlist remains active it will block the group/branch playlist from showing.
+  if (playlistData.target_type === 'group') {
+    const { data: groupScreens } = await supabase
+      .from('screen_group_assignments')
+      .select('screen_id')
+      .eq('group_id', playlistData.target_id);
+    if (groupScreens?.length) {
+      const screenIds = groupScreens.map(g => g.screen_id);
+      await supabase
+        .from('playlists')
+        .update({ is_active: false })
+        .eq('target_type', 'screen')
+        .in('target_id', screenIds);
+    }
+  } else if (playlistData.target_type === 'branch') {
+    const { data: branchScreens } = await supabase
+      .from('screens')
+      .select('id')
+      .eq('branch_id', playlistData.target_id);
+    if (branchScreens?.length) {
+      const screenIds = branchScreens.map(s => s.id);
+      await supabase
+        .from('playlists')
+        .update({ is_active: false })
+        .eq('target_type', 'screen')
+        .in('target_id', screenIds);
+    }
+  }
+
   const { error } = await supabase
     .from('playlists')
     .update({ is_active: true })
