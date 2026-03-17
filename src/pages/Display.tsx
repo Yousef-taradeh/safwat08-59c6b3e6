@@ -425,6 +425,10 @@ export default function Display() {
 
     const combinedHeartbeat = async () => {
       if (!navigator.onLine) return;
+      // Guard: don't compare playlist IDs before fetchData() completes.
+      // On first heartbeat (fires immediately on mount), currentPlaylistIdRef is still
+      // null because fetchData hasn't resolved yet → false "playlist changed" detection.
+      if (!dataReadyRef.current) return;
       try {
         const result = await heartbeatAndPoll(screenId);
         if (!result) return;
