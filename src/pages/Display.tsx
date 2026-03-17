@@ -476,14 +476,43 @@ export default function Display() {
     return () => clearTimeout(timer);
   }, [enterFullscreen]);
 
-  // Soft refresh every 6 hours — re-fetches JSON data WITHOUT reloading media (saves egress)
+  // Soft refresh every 6 hours — lightweight: only checks for playlist changes,
+  // does NOT call fetchData() (which would rebuild the full content array and
+  // trigger ContentRenderer's useEffect, risking blob URL re-resolution).
+  // The signature check (prevSig === nextSig) in quickRefresh already guarantees
+  // setContent is a no-op if content hasn't changed — zero egress risk.
   useEffect(() => {
+    if (!screen?.id) return;
     const refreshInterval = setInterval(() => {
-      console.log('[Display] 6h soft refresh');
-      fetchData();
+      console.log('[Display] 6h soft refresh — checking for playlist changes only');
+      // quickRefresh is defined inside setupRealtimeSubscription's closure.
+      // We replicate a lightweight version here to avoid a dependency on the closure:
+      // just trigger a re-fetch of the active playlist without touching the full screen data.
+      getActivePlaylistForScreen(screen.id).then(({ playlist: activePlaylist, content: playlistContent }) => {
+        const playlistChanged = activePlaylist?.id !== currentPlaylistIdRef.current;
+        if (!playlistChanged) {
+          // Same playlist — check if items changed via signature
+          setContent(prev => {
+            const prevSig = prev.map(c => `${c.id}:${c.uploadedAt?.getTime()}`).join(',');
+            const nextSig = playlistContent.map(c => `${c.id}:${c.uploadedAt?.getTime()}`).join(',');
+            if (prevSig === nextSig) return prev; // no re-render, no egress
+            console.log('[Display] 6h refresh: content changed — updating');
+            return playlistContent;
+          });
+        } else if (activePlaylist) {
+          console.log('[Display] 6h refresh: playlist changed — transitioning');
+          pendingPlaylistRef.current = { playlist: activePlaylist, content: playlistContent };
+          setNewPlaylistName(activePlaylist.name);
+          setIsPlaylistTransitioning(true);
+        } else {
+          setPlaylist(null);
+          setContent([]);
+        }
+      }).catch(err => console.error('[Display] 6h soft refresh failed:', err));
     }, 6 * 60 * 60 * 1000);
     return () => clearInterval(refreshInterval);
-  }, [fetchData]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen?.id]);
 
 
   // Handle Playlist Transition End

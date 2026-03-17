@@ -156,9 +156,13 @@ export function ContentRenderer({
       } else {
         console.log('[ContentRenderer] ⬇️ IndexedDB miss — falling back to remote URL:', current.url.split('/').pop());
       }
-    }).catch(() => {
+    }).catch((err) => {
       if (cancelled) return;
-      // IndexedDB threw — safe fallback to remote
+      // IndexedDB threw — safe fallback to remote URL.
+      // ⚠️ WARNING: This WILL trigger a new download from Supabase Storage (egress).
+      // This only happens when IndexedDB itself is broken/unavailable (e.g. storage quota exceeded,
+      // browser denied IndexedDB, or Safari private mode). Under normal conditions this never fires.
+      console.error('[ContentRenderer] 🚨 EGRESS WARNING — IndexedDB failed, falling back to remote URL:', current.url.split('/').pop(), err);
       resolvedSrcRef.current = current.url;
       setResolvedSrc(current.url);
     });
