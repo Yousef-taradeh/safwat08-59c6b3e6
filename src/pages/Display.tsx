@@ -77,6 +77,12 @@ export default function Display() {
   const [newPlaylistName, setNewPlaylistName] = useState<string>('');
   const pendingPlaylistRef = useRef<{ playlist: Playlist | null; content: ContentItem[] } | null>(null);
   const currentPlaylistIdRef = useRef<string | null>(null);
+
+  // ── dataReadyRef: set to true ONLY after fetchData() completes successfully.
+  // Prevents the heartbeat (which fires immediately on mount) from comparing
+  // currentPlaylistIdRef (still null) vs the DB value and triggering a spurious
+  // quickRefresh before the initial data load is done.
+  const dataReadyRef = useRef<boolean>(false);
   
   // Channel Refs
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
@@ -170,6 +176,8 @@ export default function Display() {
       setError('Failed to load content');
     } finally {
       setIsLoading(false);
+      // Signal that initial data is ready — heartbeat can now safely compare playlist IDs
+      dataReadyRef.current = true;
     }
   }, [slug]);
 
@@ -417,6 +425,10 @@ export default function Display() {
 
     const combinedHeartbeat = async () => {
       if (!navigator.onLine) return;
+      // Guard: don't compare playlist IDs before fetchData() completes.
+      // On first heartbeat (fires immediately on mount), currentPlaylistIdRef is still
+      // null because fetchData hasn't resolved yet → false "playlist changed" detection.
+      if (!dataReadyRef.current) return;
       try {
         const result = await heartbeatAndPoll(screenId);
         if (!result) return;
