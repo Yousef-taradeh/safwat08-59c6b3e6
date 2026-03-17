@@ -77,6 +77,12 @@ export default function Display() {
   const [newPlaylistName, setNewPlaylistName] = useState<string>('');
   const pendingPlaylistRef = useRef<{ playlist: Playlist | null; content: ContentItem[] } | null>(null);
   const currentPlaylistIdRef = useRef<string | null>(null);
+
+  // ── dataReadyRef: set to true ONLY after fetchData() completes successfully.
+  // Prevents the heartbeat (which fires immediately on mount) from comparing
+  // currentPlaylistIdRef (still null) vs the DB value and triggering a spurious
+  // quickRefresh before the initial data load is done.
+  const dataReadyRef = useRef<boolean>(false);
   
   // Channel Refs
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
