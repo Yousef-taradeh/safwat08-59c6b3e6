@@ -244,7 +244,11 @@ export async function getContent(): Promise<ContentItem[]> {
     thumbnailUrl: c.thumbnail_url || c.url,
     duration: c.duration,
     fileSize: Number(c.file_size),
-    uploadedAt: new Date(c.created_at),
+    // CRITICAL: use updated_at NOT created_at — IndexedDB cache key comparison
+    // depends on this value. Using created_at causes the cache to NEVER detect
+    // content updates (old file cached forever) or to always see a mismatch
+    // if created_at differs from updated_at (forces re-download every session).
+    uploadedAt: new Date(c.updated_at),
   }));
 }
 

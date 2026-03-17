@@ -185,6 +185,12 @@ export default function Display() {
     },
   });
 
+  // Track current playlist ID ref for filtering playlist_items updates
+  const currentPlaylistIdForFilterRef = useRef<string | null>(null);
+  useEffect(() => {
+    currentPlaylistIdForFilterRef.current = playlist?.id ?? null;
+  }, [playlist?.id]);
+
   // Setup Realtime Subscription
   const setupRealtimeSubscription = useCallback(() => {
     if (!screen?.id) return;
@@ -249,6 +255,29 @@ export default function Display() {
       }
     };
 
+    // Soft-refresh settings only — does NOT rebuild content array, does NOT re-download media
+    const refreshSettingsOnly = async () => {
+      try {
+        console.log('[Display] Settings-only refresh (no media reload)');
+        const { data: screenRow } = await supabase
+          .from('screens')
+          .select('id, branch_id')
+          .eq('id', screen.id)
+          .single();
+        if (!screenRow) return;
+        const { data: groupAssignments } = await supabase
+          .from('screen_group_assignments')
+          .select('group_id')
+          .eq('screen_id', screen.id);
+        const gIds = groupAssignments?.map(a => a.group_id) || [];
+        const { getEffectiveDisplaySettings } = await import('@/lib/api/display-settings');
+        const newSettings = await getEffectiveDisplaySettings(screen.id, gIds, screenRow.branch_id);
+        setSettings(newSettings);
+      } catch (err) {
+        console.error('[Display] Settings refresh failed:', err);
+      }
+    };
+
     const channel = supabase
       .channel(`display-${screen.id}-realtime-${Date.now()}`)
       .on(
@@ -302,18 +331,35 @@ export default function Display() {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'playlist_items' },
-        () => {
-          // playlist_items don't carry target info — debounce to avoid rapid-fire refreshes
-          console.log('[Display] Playlist items changed');
+        (payload) => {
+          // BUG FIX: Filter playlist_items updates to only those belonging to the current
+          // active playlist. Without this, EVERY item change in the system (for ANY screen)
+          // was triggering a quickRefresh — causing unnecessary DB queries and potential
+          // video re-cache for unrelated screens.
+          const changed = (payload.new || payload.old) as any;
+          const currentPid = currentPlaylistIdForFilterRef.current;
+          if (currentPid && changed?.playlist_id && changed.playlist_id !== currentPid) {
+            console.log('[Display] Ignoring playlist_items change for different playlist:', changed.playlist_id);
+            return;
+          }
+          console.log('[Display] Relevant playlist_items changed');
           debouncedRefresh();
         }
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'display_settings' },
-        () => {
-          console.log('Display settings changed');
-          fetchData();
+        (payload) => {
+          // BUG FIX: Previously called fetchData() which rebuilds the entire content array
+          // with a new reference, triggering ContentRenderer's useEffect and potentially
+          // re-resolving video blob URLs (unnecessary IndexedDB lookups / egress risk).
+          // Now we only refresh settings — content stays untouched.
+          const changed = (payload.new || payload.old) as any;
+          // Skip if settings change is for a completely unrelated target
+          // (we can't easily filter by screen hierarchy here without extra queries,
+          //  but refreshSettingsOnly is lightweight — just a few small JSON reads)
+          console.log('[Display] Display settings changed — soft settings refresh only');
+          refreshSettingsOnly();
         }
       )
       // NOTE: Removed global 'content' table listener — it was triggering quickRefresh
