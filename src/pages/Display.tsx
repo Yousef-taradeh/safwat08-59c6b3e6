@@ -176,6 +176,8 @@ export default function Display() {
       setError('Failed to load content');
     } finally {
       setIsLoading(false);
+      // Signal that initial data is ready — heartbeat can now safely compare playlist IDs
+      dataReadyRef.current = true;
     }
   }, [slug]);
 
